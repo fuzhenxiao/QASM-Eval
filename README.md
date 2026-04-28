@@ -4,9 +4,9 @@ QASM-Eval is an OpenQASM 3 dataset for evaluating and training language models o
 
 This repository is designed for benchmark release and anonymous paper review. It contains the released dataset, evaluation scripts, and a lightweight test runner for model benchmarking on QASM core-block completion tasks.
 
-Two models fine-tuned on QASM-Eval are also released here (latest releases):
-- Llama-3.1-8B-Instruct-QASM-Eval (LoRA)
-- Llama-3.3-70B-Instruct-QASM-Eval (LoRA)
+Two models fine-tuned on QASM-Eval are also released here (latest releases) or on Hugging Face:
+- [Llama-3.1-8B-Instruct-QASM-Eval](https://huggingface.co/AnonymousORG01/Llama-3.1-8B-Instruct-QASM-Eval)
+- [Llama-3.3-70B-Instruct-QASM-Eval](https://huggingface.co/AnonymousORG01/Llama-3.3-70B-Instruct-QASM-Eval)
 
 ## 1. Project Overview
 
