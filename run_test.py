@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 import random
 import sys
 from datetime import datetime
@@ -28,16 +29,16 @@ TEST_DATA_PATH = "data/test.jsonl"
 OUTPUT_DIR = "test_runs"
 
 # mode: "random_sample" or "all"
-RUN_MODE = "all" # or "random_sample"
-NUM_RANDOM_SAMPLES = 8 # if RUN_MODE is "all", then it will select all 100 test tasks
+RUN_MODE = "all"  # or "random_sample"
+NUM_RANDOM_SAMPLES = 8  # if RUN_MODE is "all", it selects all 1,200 test tasks
 RANDOM_SEED = 20260426
 
-# generate k candidates per task, then compute pass@k for k = 1..PASS_AT_K
+# Generate n=PASS_AT_K candidates per task and estimate pass@k for k=1..n.
 PASS_AT_K = 5
 
-LLM_CHOICE = "openai/gpt-oss-120b" # the model to be tested
+LLM_CHOICE = "openai/gpt-oss-120b"  # the model to be tested
 LLM_PROVIDER = "nebius"
-LLM_KEY='YOUR OWN KEY HERE'
+LLM_KEY = "YOUR OWN KEY HERE"
 LLM_TEMPERATURE = 0.7
 LLM_MAX_TOKENS = 1200
 
@@ -71,21 +72,46 @@ def select_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return rng.sample(records, sample_size)
 
 
-def compute_pass_at_k(per_task_ok_by_k: dict[str, dict[int, bool]], k_max: int) -> dict[int, float]:
-    task_ids = sorted(per_task_ok_by_k.keys())
+def compute_pass_at_k(
+    per_task_ok_by_k: dict[str, dict[int, bool]], k_max: int
+) -> dict[int, float]:
+    """Compute the standard unbiased pass@k estimator.
+
+    For each task with n generated samples and c correct samples, the estimate is
+    1 - C(n-c, k) / C(n, k). The reported score is the mean across tasks.
+    """
+    if k_max < 1:
+        raise ValueError("k_max must be at least 1")
+
+    task_ids = sorted(per_task_ok_by_k)
     if not task_ids:
         return {k: 0.0 for k in range(1, k_max + 1)}
 
-    pass_at_k: dict[int, float] = {}
-    for k_value in range(1, k_max + 1):
-        passed = 0
-        for task_id in task_ids:
-            ok_map = per_task_ok_by_k.get(task_id, {})
-            hit = any(ok for idx, ok in ok_map.items() if idx <= k_value)
-            if hit:
-                passed += 1
-        pass_at_k[k_value] = passed / len(task_ids)
-    return pass_at_k
+    estimates_by_k: dict[int, list[float]] = {
+        k: [] for k in range(1, k_max + 1)
+    }
+    for task_id in task_ids:
+        outcomes = list(per_task_ok_by_k[task_id].values())
+        n = len(outcomes)
+        if n < k_max:
+            raise ValueError(
+                f"Task {task_id!r} has {n} samples, fewer than k_max={k_max}"
+            )
+
+        c = sum(bool(ok) for ok in outcomes)
+        for k_value in range(1, k_max + 1):
+            if n - c < k_value:
+                estimate = 1.0
+            else:
+                estimate = 1.0 - (
+                    math.comb(n - c, k_value) / math.comb(n, k_value)
+                )
+            estimates_by_k[k_value].append(estimate)
+
+    return {
+        k: sum(estimates) / len(estimates)
+        for k, estimates in estimates_by_k.items()
+    }
 
 
 def build_output_paths(root_dir: Path) -> tuple[Path, Path]:
@@ -135,7 +161,6 @@ def main() -> dict[str, Any]:
     per_task_ok_by_k: dict[str, dict[int, bool]] = {}
     details: list[dict[str, Any]] = []
     domain_counts: dict[str, int] = {}
-    domain_pass_counts_by_k: dict[str, dict[int, int]] = {}
 
     for task_idx, record in enumerate(selected_records, start=1):
         task_id = record["task_id"]
@@ -148,7 +173,7 @@ def main() -> dict[str, Any]:
 
         print(f"[task {task_idx}/{len(selected_records)}] {task_id} | domain={domain}")
 
-        for k_idx in range(1, PASS_AT_K + 1):
+        for sample_index in range(1, PASS_AT_K + 1):
             response = client.generate(
                 prompt=build_user_prompt(prompt),
                 system_prompt=SYSTEM_PROMPT,
@@ -161,12 +186,12 @@ def main() -> dict[str, Any]:
             )
             evaluation = result.to_dict()
 
-            per_task_ok_by_k[task_id][k_idx] = bool(result.ok)
+            per_task_ok_by_k[task_id][sample_index] = bool(result.ok)
             details.append(
                 {
                     "task_id": task_id,
                     "domain": domain,
-                    "sample_index": k_idx,
+                    "sample_index": sample_index,
                     "model": LLM_CHOICE,
                     "provider": LLM_PROVIDER,
                     "response": response,
@@ -175,7 +200,7 @@ def main() -> dict[str, Any]:
             )
 
             print(
-                f"  - sample {k_idx}/{PASS_AT_K}: "
+                f"  - sample {sample_index}/{PASS_AT_K}: "
                 f"ok={result.ok}, "
                 f"syntax_ok={result.syntax_ok}, "
                 f"element_ok={result.element_ok}, "
@@ -185,24 +210,17 @@ def main() -> dict[str, Any]:
 
     overall_pass_at_k = compute_pass_at_k(per_task_ok_by_k, PASS_AT_K)
 
-    for domain, count in domain_counts.items():
-        domain_task_ids = [
-            record["task_id"] for record in selected_records if record["domain"] == domain
-        ]
-        domain_ok_map = {task_id: per_task_ok_by_k[task_id] for task_id in domain_task_ids}
-        domain_pass_values = compute_pass_at_k(domain_ok_map, PASS_AT_K)
-        domain_pass_counts_by_k[domain] = {
-            k_value: int(round(domain_pass_values[k_value] * count)) for k_value in domain_pass_values
-        }
-
-    summary = {
+    summary: dict[str, Any] = {
         "config": {
             "test_data_path": str(test_data_path),
             "output_dir": str(output_root),
             "run_mode": RUN_MODE,
             "num_random_samples": NUM_RANDOM_SAMPLES,
             "random_seed": RANDOM_SEED,
-            "pass_at_k": PASS_AT_K,
+            "samples_per_task": PASS_AT_K,
+            "pass_at_k_max": PASS_AT_K,
+            "pass_at_k_estimator": "unbiased",
+            "pass_at_k_formula": "1 - comb(n - c, k) / comb(n, k)",
             "llm_choice": LLM_CHOICE,
             "llm_provider": LLM_PROVIDER,
             "llm_temperature": LLM_TEMPERATURE,
@@ -228,9 +246,13 @@ def main() -> dict[str, Any]:
 
     for domain, count in sorted(domain_counts.items()):
         domain_task_ids = [
-            record["task_id"] for record in selected_records if record["domain"] == domain
+            record["task_id"]
+            for record in selected_records
+            if record["domain"] == domain
         ]
-        domain_ok_map = {task_id: per_task_ok_by_k[task_id] for task_id in domain_task_ids}
+        domain_ok_map = {
+            task_id: per_task_ok_by_k[task_id] for task_id in domain_task_ids
+        }
         domain_pass_at_k = compute_pass_at_k(domain_ok_map, PASS_AT_K)
         summary["by_domain"][domain] = {
             "task_count": count,
@@ -241,7 +263,7 @@ def main() -> dict[str, Any]:
     write_jsonl(details_path, details)
 
     print("")
-    print("=== Summary ===")
+    print("=== Summary (unbiased pass@k estimator) ===")
     print(f"selected tasks: {len(selected_records)} / {len(records)}")
     for k_value in range(1, PASS_AT_K + 1):
         print(f"pass@{k_value}: {overall_pass_at_k[k_value]:.4f}")

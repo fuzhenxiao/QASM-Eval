@@ -1,10 +1,14 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 import sys
+import threading
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Callable, TypeVar
 
 #==============================================================================
@@ -19,6 +23,10 @@ _T = TypeVar("_T")
 
 SEED_DIST = 12345
 SEED_TIMELINE = 67890
+GOLDEN_CACHE_VERSION = 1
+DEFAULT_GOLDEN_CACHE_DIR = (
+    Path(__file__).resolve().parents[1] / ".eval_cache_completion_v1"
+)
 
 @dataclass
 class EvaluationResult:
@@ -64,6 +72,78 @@ def _with_numpy_seed(seed: int, func: Callable[[], _T]) -> _T:
         return func()
     finally:
         np.random.set_state(state)
+
+
+def _golden_cache_dir() -> Path:
+    configured = os.environ.get("QASM_EVAL_GOLDEN_CACHE_DIR", "").strip()
+    return Path(configured) if configured else DEFAULT_GOLDEN_CACHE_DIR
+
+
+def _golden_reference(judge, golden_code: str, task_type: str):
+    """Load or compute deterministic golden semantics for one benchmark case."""
+    metadata = {
+        "version": GOLDEN_CACHE_VERSION,
+        "golden_sha256": hashlib.sha256(golden_code.encode("utf-8")).hexdigest(),
+        "task_type": task_type,
+        "shots_dist_golden": judge.SHOTS_DIST_GOLDEN,
+        "seed_dist": SEED_DIST,
+        "seed_timeline": SEED_TIMELINE,
+    }
+    cache_key = hashlib.sha256(
+        json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    cache_enabled = os.environ.get("QASM_EVAL_DISABLE_CACHE", "") != "1"
+    cache_path = _golden_cache_dir() / f"{cache_key}.json"
+
+    if cache_enabled:
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            if payload.get("metadata") == metadata:
+                events = [
+                    judge.TimelineEvent(**event) for event in payload["events"]
+                ]
+                return payload["exist"], payload["dist"], events
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            pass
+
+    golden_program = judge.parse_qasm_safely(golden_code)
+    golden_exist = judge.extract_exist_from_program(golden_program)
+    golden_dist = _with_numpy_seed(
+        SEED_DIST,
+        lambda: judge.simulate_distribution_safely(
+            golden_code, shots=judge.SHOTS_DIST_GOLDEN
+        ),
+    )
+    golden_timeline_text = _with_numpy_seed(
+        SEED_TIMELINE,
+        lambda: judge.simulate_timeline_text_safely(golden_code),
+    )
+    golden_events = judge.parse_timeline_events(golden_timeline_text)
+
+    if cache_enabled:
+        payload = {
+            "metadata": metadata,
+            "exist": golden_exist,
+            "dist": golden_dist,
+            "events": [asdict(event) for event in golden_events],
+        }
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = cache_path.with_suffix(
+            f".{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        try:
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            temporary.replace(cache_path)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+    return golden_exist, golden_dist, golden_events
 
 
 def clean_returned_code(text: str) -> str:
@@ -134,6 +214,16 @@ def infer_domain(golden_code: str, default: str = "complex") -> str:
     return default
 
 
+def prime_golden_cache(
+    golden_code: str,
+    domain: str | None = None,
+) -> None:
+    """Precompute the deterministic golden distribution and timeline cache."""
+    judge = _import_judge()
+    task_type = domain or infer_domain(golden_code)
+    _golden_reference(judge, golden_code, task_type)
+
+
 def evaluate_qasm_completion(
     golden_code: str,
     returned_code: str,
@@ -190,17 +280,11 @@ def evaluate_qasm_completion(
         )
 
     try:
-        golden_program = judge.parse_qasm_safely(golden_code)
-        golden_exist = judge.extract_exist_from_program(golden_program)
-        golden_dist = _with_numpy_seed(
-            SEED_DIST,
-            lambda: judge.simulate_distribution_safely(golden_code, shots=judge.SHOTS_DIST_GOLDEN),
+        golden_exist, golden_dist, golden_events = _golden_reference(
+            judge,
+            golden_code,
+            task_type,
         )
-        golden_timeline_text = _with_numpy_seed(
-            SEED_TIMELINE,
-            lambda: judge.simulate_timeline_text_safely(golden_code),
-        )
-        golden_events = judge.parse_timeline_events(golden_timeline_text)
 
         try:
             candidate_program = judge.parse_qasm_safely(candidate_qasm)
@@ -226,6 +310,24 @@ def evaluate_qasm_completion(
                 dist_ok=None,
                 timeline_ok=None,
                 detail=f"exist missing: {missing[:20]}" + (" ..." if len(missing) > 20 else ""),
+                candidate_qasm=candidate_qasm,
+                cleaned_returned_code=cleaned,
+            )
+
+        # A model can emit an unconditional loop with no exit.  Running the
+        # shot-based simulator on it is both semantically invalid for these
+        # finite benchmark tasks and can stall an entire evaluation fold.
+        if (
+            re.search(r"(?m)^\s*while\s*\(\s*true\s*\)", cleaned)
+            and not re.search(r"(?m)^\s*break\s*;", cleaned)
+        ):
+            return EvaluationResult(
+                ok=False,
+                syntax_ok=True,
+                element_ok=True,
+                dist_ok=False,
+                timeline_ok=False,
+                detail="nonterminating while(true) loop without break",
                 candidate_qasm=candidate_qasm,
                 cleaned_returned_code=cleaned,
             )

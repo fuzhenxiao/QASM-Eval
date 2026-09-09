@@ -14,10 +14,10 @@ QASM-Eval studies code generation for advanced OpenQASM 3 programs rather than o
 
 The benchmark is intended to test whether a model can generate functionally correct QASM 3 code with advanced features under realistic constraints:
 
-| split | records | domain composition |
+| dataset | records | domain composition |
 | --- | ---: | --- |
-| train | 4,000 | 1,000 timing, 1,000 classical, 1,000 pulse, 1,000 complex |
-| test | 100 | 25 timing, 25 classical, 25 pulse, 25 complex |
+| training pool | 4,000 | 1,000 timing, 1,000 classical, 1,000 pulse, 1,000 complex |
+| test | 1,200 | 300 timing, 300 classical, 300 pulse, 300 complex |
 
 - `timing`: tasks involving delays, durations, schedule-sensitive structure, and timeline behavior
 - `classical`: tasks involving measurement, bits, registers, conditionals, and classical control
@@ -60,7 +60,7 @@ To launch an evaluation run:
 python3 run_test.py
 ```
 
-The output includes a detailed report with the overall pass@k metric and pass rates for each task category. Per-sample error types is also available, the scripts in ./scripts contain the full simulator implementations and the associated evaluation logic.
+The output includes a detailed report with the overall pass@k metric and pass rates for each task category. Per-sample error types are also available. The scripts in `scripts/` contain the simulator implementations and evaluation logic.
 
 ### 2. Use QASM-Eval as a training dataset
 
@@ -94,10 +94,13 @@ This path is useful if you want to create a new benchmark variant, regenerate pr
 
 For each selected task, `run_test.py` generates `PASS_AT_K` independent model completions. These are evaluated against the corresponding golden program using `scripts/evaluator.py`.
 
-The reported `pass@k` follows the standard benchmark-style interpretation used here:
+The reported `pass@k` uses the standard unbiased estimator. For each task, count
+`c` correct completions among all `n = PASS_AT_K` generated completions:
 
-- a task counts as passed at `k` if at least one of the first `k` sampled completions is correct
-- overall `pass@k` is the fraction of selected tasks that satisfy the condition above
+`pass@k = 1 - C(n - c, k) / C(n, k)`, for `1 <= k <= n`.
+
+The overall and per-domain scores average these task-level estimates. With five
+completions, pass@1 is `c / 5`; the result does not depend on candidate order.
 
 The evaluation output includes the following boolean fields:
 
@@ -107,7 +110,7 @@ The evaluation output includes the following boolean fields:
 - `dist_ok`: whether the generated program matches the target output distribution
 - `timeline_ok`: whether the generated program matches the target timing behavior
 
-`None` appears when a particular check is not required for that specific task. If you want to change the evaluation rule so that the check is enforced, you can modify the corresponding logic in `decide_ok()` at `scripts/judge.py`.
+`None` indicates that a check was not completed or is not applicable. If you want to change the evaluation rule so that the check is enforced, you can modify the corresponding logic in `decide_ok()` at `scripts/judge.py`.
 
 ## 4. Task Format
 
@@ -158,7 +161,7 @@ Key paths:
 
 - `data/`: released benchmark data
 - `scripts/`: scripts needed to evaluate LLM generated answers against a golden program
-- `run_test.py`: configurable script for sampling test tasks, querying an LLM, and computing pass@k
+- `run_test.py`: configurable script for sampling test tasks, querying an LLM, and computing unbiased pass@k
 - `dataset_factory/`: auxiliary generation and prompt-building code used in the broader workflow
 
 ## 6. Installation
@@ -173,6 +176,8 @@ Recommended environment:
 | `qiskit` | `2.0.2` | gate matrices, operators, and Statevector-based simulation |
 | `qutip` | `5.2.2` | waveform / Hamiltonian-style pulse simulation support |
 | `pyarrow` | `22.0.0` | reading and writing Parquet dataset files |
+| `openai` | `2.48.0` | model API client |
+| `requests` | `2.32.4` | HTTP requests used by the model client |
 
 ## 7. Output Files
 
@@ -185,7 +190,7 @@ This makes it easy to inspect both aggregate results and individual failures.
 
 ## 8. Notes and Caveats
 
-- Quantum-program simulation can be stochastic. The evaluator internally fixes seeds for key checks, but simulation-heavy workflows can still be computationally expensive.
+- Quantum-program simulation can be stochastic and computationally expensive.
 - Some models may emit reasoning traces or thinking content in different output formats. The current code does not include dedicated handling for these variations, and support for them has been left as future work.
 - Some models may prepend explanations, markdown fences, or full-program rewrites. These can hurt evaluation even if parts of the generated code are reasonable.
 
