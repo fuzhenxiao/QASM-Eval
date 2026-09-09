@@ -219,6 +219,223 @@ def tvd(dist_a: Dict[str, float], dist_b: Dict[str, float]) -> float:
         l1 += abs(dist_a.get(k, 0.0) - dist_b.get(k, 0.0))
     return 0.5 * l1
 
+
+def _align_outcome_counts(
+    counts_a: Dict[str, int], counts_b: Dict[str, int]
+) -> Tuple[List[str], List[int], List[int]]:
+    """Align raw shot histograms without projecting or merging joint outcomes."""
+    from collections.abc import Mapping
+    from numbers import Integral
+
+    histograms = []
+    for name, counts in (("counts_a", counts_a), ("counts_b", counts_b)):
+        if not isinstance(counts, Mapping):
+            raise TypeError(f"{name} must map complete outcome labels to counts")
+        validated = {}
+        for outcome, count in counts.items():
+            if not isinstance(outcome, str):
+                raise TypeError(f"{name}: outcome labels must be strings")
+            if isinstance(count, bool) or not isinstance(count, Integral) or count < 0:
+                raise ValueError(f"{name}: counts must be nonnegative integers")
+            if count:
+                validated[outcome] = int(count)
+        if not validated:
+            raise ValueError(f"{name} must contain at least one observed shot")
+        histograms.append(validated)
+    # The likelihood calculation converts counts to float64, and the random
+    # table sampler uses fixed-width integers. Reject totals that lose precision.
+    if sum(sum(counts.values()) for counts in histograms) > 2**53 - 1:
+        raise ValueError("Combined shot count exceeds the exact float64 integer range")
+    outcomes = sorted(set(histograms[0]) | set(histograms[1]))
+    return (
+        outcomes,
+        [histograms[0].get(outcome, 0) for outcome in outcomes],
+        [histograms[1].get(outcome, 0) for outcome in outcomes],
+    )
+
+
+def multinomial_homogeneity_test(
+    counts_a: Dict[str, int],
+    counts_b: Dict[str, int],
+    *,
+    n_resamples: int = 9999,
+    seed: Optional[int] = 0,
+    alpha: float = 0.05,
+) -> dict:
+    """Conditional Monte Carlo G-test of two joint outcome distributions.
+
+    Inputs are raw counts from two independent, fixed-size i.i.d. shot samples,
+    not normalized probabilities. Each key identifies the complete measured
+    outcome (for example, the simulator's joint classical-register label).
+    Keeping joint labels preserves correlations between measured bits.
+
+    The statistic is 2 * sum(O * log(O / E)) for the 2-by-K count table.
+    Null tables retain both sample sizes and pooled outcome counts, using
+    scipy.stats.random_table (Patefield sampling). Rare outcomes are retained;
+    no large-expected-count chi-square approximation or pseudocounts are used.
+    The Monte Carlo p-value is (exceedances + 1) / (n_resamples + 1), including
+    ties. Non-rejection is not evidence that the distributions are equivalent.
+
+    A local RNG makes repeated calls with the same seed reproducible without
+    changing the simulator's random state.
+    """
+    from numbers import Integral
+    import numpy as np
+    from scipy.special import xlogy
+    from scipy.stats import random_table
+
+    if isinstance(n_resamples, bool) or not isinstance(n_resamples, Integral) or n_resamples < 1:
+        raise ValueError("n_resamples must be a positive integer")
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, Integral) or seed < 0):
+        raise ValueError("seed must be a nonnegative integer or None")
+    if isinstance(alpha, bool) or not math.isfinite(alpha) or not 0.0 < alpha < 1.0:
+        raise ValueError("alpha must be strictly between zero and one")
+    n_resamples = int(n_resamples)
+    seed = None if seed is None else int(seed)
+    outcomes, a, b = _align_outcome_counts(counts_a, counts_b)
+    n_a, n_b = sum(a), sum(b)
+    observed = np.asarray([a, b], dtype=np.int64)
+    row_totals = observed.sum(axis=1)
+    column_totals = observed.sum(axis=0)
+    expected = np.outer(row_totals.astype(float), column_totals.astype(float)) / (n_a + n_b)
+    statistic = max(0.0, float(2.0 * xlogy(observed, observed / expected).sum()))
+    empirical_tvd = min(1.0, 0.5 * math.fsum(abs(x / n_a - y / n_b) for x, y in zip(a, b)))
+
+    completed = 0
+    exceedances = 0
+    if len(outcomes) == 1:
+        pvalue = 1.0  # The conditional table is constant; this is not equivalence.
+    else:
+        rng = np.random.default_rng(seed)
+        batch_size = min(256, max(1, 1_000_000 // (2 * len(outcomes))))
+        tie_tolerance = 64 * np.finfo(float).eps * max(1.0, statistic)
+        while completed < n_resamples:
+            batch = min(batch_size, n_resamples - completed)
+            tables = random_table.rvs(
+                row_totals, column_totals, size=batch,
+                method="patefield", random_state=rng,
+            )
+            statistics = 2.0 * xlogy(tables, tables / expected).sum(axis=(1, 2))
+            exceedances += int(np.count_nonzero(statistics >= statistic - tie_tolerance))
+            completed += batch
+        pvalue = (exceedances + 1) / (completed + 1)
+    return {
+        "statistic": statistic,
+        "pvalue": pvalue,
+        "reject_equal_distribution": bool(pvalue < alpha),
+        "alpha": float(alpha),
+        "empirical_tvd": empirical_tvd,
+        "shots_a": n_a,
+        "shots_b": n_b,
+        "observed_outcomes": len(outcomes),
+        "n_resamples": completed,
+        "seed": seed,
+    }
+
+
+def _multinomial_tvd_radius(shots: int, support_size: int, failure_probability: float) -> float:
+    """Invert the finite-alphabet L1 concentration bound in TVD units."""
+    if support_size == 1:
+        return 0.0
+    # log(2**K - 2), without constructing an exponentially large integer.
+    try:
+        log_factor = support_size * math.log(2.0)
+    except OverflowError:
+        return 1.0
+    log_factor += math.log1p(-2.0 * math.exp(-log_factor))
+    return min(1.0, math.sqrt((log_factor - math.log(failure_probability)) / (2.0 * shots)))
+
+
+def multinomial_tvd_interval(
+    counts_a: Dict[str, int],
+    counts_b: Dict[str, int],
+    *,
+    support_size: int,
+    confidence_level: float = 0.95,
+) -> dict:
+    """Finite-sample confidence interval for TVD over the full outcome alphabet.
+
+    Both histograms must be raw counts of complete joint outcomes from i.i.d.
+    shots. support_size is a pre-specified upper bound on the union of all
+    possible outcomes of both programs, including outcomes never observed.
+    It must not be inferred from the observed support. For exactly m measured
+    bits it is 2**m; a simulator label containing other registers may have a
+    larger alphabet. This parameter is an assumption supplied by the caller.
+
+    For alphabet size K > 1, use
+        Pr(TVD(p_hat, p) >= r) <= (2**K - 2) * exp(-2 * n * r**2).
+    This follows from a union bound over outcome subsets and one-sided
+    Hoeffding bounds (also the L1 bound of Weissman et al., HPL-2003-97R1).
+    Allocate half the failure probability to each sample and apply the
+    triangle inequality to their two radii. No binary variance approximation,
+    normal approximation, support truncation or smoothing is used.
+
+    Coverage is at least confidence_level for a fixed comparison under the
+    stated sampling/support assumptions. The bound is conservative; large
+    alphabets or small samples can yield [0, 1]. Repeated/adaptive comparisons
+    require a separate error-budget policy.
+    """
+    from numbers import Integral
+
+    if isinstance(support_size, bool) or not isinstance(support_size, Integral) or support_size < 1:
+        raise ValueError("support_size must be a positive integer")
+    if (isinstance(confidence_level, bool) or not math.isfinite(confidence_level)
+            or not 0.0 < confidence_level < 1.0):
+        raise ValueError("confidence_level must be strictly between zero and one")
+    support_size = int(support_size)
+    outcomes, a, b = _align_outcome_counts(counts_a, counts_b)
+    if support_size < len(outcomes):
+        raise ValueError("support_size is smaller than the observed union of outcomes")
+    n_a, n_b = sum(a), sum(b)
+    distance = min(1.0, 0.5 * math.fsum(abs(x / n_a - y / n_b) for x, y in zip(a, b)))
+    failure_probability = (1.0 - confidence_level) / 2.0
+    radius_a = _multinomial_tvd_radius(n_a, support_size, failure_probability)
+    radius_b = _multinomial_tvd_radius(n_b, support_size, failure_probability)
+    return {
+        "empirical_tvd": distance,
+        "lower": max(0.0, distance - radius_a - radius_b),
+        "upper": min(1.0, distance + radius_a + radius_b),
+        "confidence_level": float(confidence_level),
+        "radius_a": radius_a,
+        "radius_b": radius_b,
+        "shots_a": n_a,
+        "shots_b": n_b,
+        "support_size": support_size,
+        "observed_outcomes": len(outcomes),
+    }
+
+
+def multinomial_equivalence_test(
+    counts_a: Dict[str, int],
+    counts_b: Dict[str, int],
+    *,
+    support_size: int,
+    tolerance: float,
+    confidence_level: float = 0.95,
+) -> dict:
+    """Compare a multinomial TVD interval with a pre-specified tolerance.
+
+    Return 'equivalent' only if the entire interval is within tolerance,
+    'different' if its lower endpoint exceeds tolerance, or 'inconclusive'
+    otherwise. Equivalence means TVD <= tolerance, not exact equality or
+    equality of quantum states beyond the measured output distribution.
+    Tolerance and support_size must be fixed independently of these samples.
+    """
+    if isinstance(tolerance, bool) or not math.isfinite(tolerance) or not 0.0 <= tolerance <= 1.0:
+        raise ValueError("tolerance must be between zero and one")
+    interval = multinomial_tvd_interval(
+        counts_a, counts_b, support_size=support_size,
+        confidence_level=confidence_level,
+    )
+    if interval["upper"] <= tolerance:
+        decision = "equivalent"
+    elif interval["lower"] > tolerance:
+        decision = "different"
+    else:
+        decision = "inconclusive"
+    return {**interval, "tolerance": float(tolerance), "decision": decision}
+
+
 def simulate_distribution_safely(qasm: str, shots: int) -> Dict[str, float]:
     buf = io.StringIO()
     with redirect_stdout(buf), redirect_stderr(buf):
