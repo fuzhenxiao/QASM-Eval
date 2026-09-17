@@ -40,7 +40,7 @@ LLM_CHOICE = "openai/gpt-oss-120b"  # the model to be tested
 LLM_PROVIDER = "nebius"
 LLM_KEY = "YOUR OWN KEY HERE"
 LLM_TEMPERATURE = 0.7
-LLM_MAX_TOKENS = 1200
+LLM_MAX_TOKENS = 6000 
 
 SYSTEM_PROMPT = (
     "You complete missing QASM core blocks.\n"

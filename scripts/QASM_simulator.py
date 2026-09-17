@@ -2874,7 +2874,7 @@ def extract_exist(qasm_str: str) -> dict:
     walk(getattr(program, "statements", None))
     return exist
 
-def simulate_qasm_distribution(qasm_str, shots=1000):
+def simulate_qasm_distribution(qasm_str, shots=8000):
     program = openqasm3.parse(qasm_str)
     
     sys_model = {
@@ -3017,7 +3017,7 @@ c[3] = measure q[3];
 // === MEASUREMENT_END ===
     '''
     try:
-        distribution = simulate_qasm_distribution(tobetested, shots=1000)
+        distribution = simulate_qasm_distribution(tobetested, shots=8000)
         for outcome, prob in distribution.items():
             print(f"State [{outcome}]: {prob:.2%}")
     except Exception as e:

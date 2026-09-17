@@ -14,8 +14,8 @@ import openqasm3
 import QASM_simulator as sim
 
 
-SHOTS_DIST_GOLDEN = 1000 # or recommend 8000 
-SHOTS_DIST_CAND = 1000 ## or recommend 8000 
+SHOTS_DIST_GOLDEN = 8000
+SHOTS_DIST_CAND = 8000
 
 TOL_DIST_DEFAULT = 0.05
 TOL_DIST_TIMING = 0.1

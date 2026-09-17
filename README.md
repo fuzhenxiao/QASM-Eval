@@ -72,6 +72,8 @@ Load the released JSONL or Parquet files directly for supervised fine-tuning, an
 
 You can also load the Parquet files if that better fits your training stack.
 
+For general use, use the full `data/train.jsonl` (4,000 records) and `data/test.jsonl` (1,200 records), or their Parquet equivalents. For fold-held-out training and evaluation, use the matching `data/fold-held-out/fold1/` through `data/fold-held-out/fold5/` directories instead: each contains `train.jsonl` (3,280 records), `train_chat.jsonl` (the same training set in messages format), and `test.jsonl` (240 records). Set `TEST_DATA_PATH` in `run_test.py` to the corresponding fold's test file.
+
 ### 3. Generate your own dataset in bulk
 
 ```bash
@@ -93,6 +95,8 @@ This path is useful if you want to create a new benchmark variant, regenerate pr
 ## 3. Evaluation Protocol
 
 For each selected task, `run_test.py` generates `PASS_AT_K` independent model completions. These are evaluated against the corresponding golden program using `scripts/evaluator.py`.
+
+Distribution checks use 8,000 simulation shots each for the reference and candidate programs.
 
 The reported `pass@k` uses the standard unbiased estimator. For each task, count
 `c` correct completions among all `n = PASS_AT_K` generated completions:
@@ -141,6 +145,11 @@ data/
   test.parquet
   train.jsonl
   test.jsonl
+  cv/
+    fold1/ ... fold5/
+      train.jsonl
+      train_chat.jsonl
+      test.jsonl
 
 scripts/
   evaluator.py
